@@ -1,6 +1,10 @@
 -- Vibepress Platform Database Schema
 -- Chạy tự động khi MySQL container khởi động lần đầu
 
+CREATE USER IF NOT EXISTS 'vibepress'@'%' IDENTIFIED BY 'vibepress_pass';
+GRANT ALL PRIVILEGES ON `vibepress`.* TO 'vibepress'@'%';
+FLUSH PRIVILEGES;
+
 CREATE DATABASE IF NOT EXISTS `vibepress` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE `vibepress`;
 

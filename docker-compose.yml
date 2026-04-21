@@ -1,82 +1,35 @@
 services:
-  mysql:
+  db:
     image: mysql:8.0
-    container_name: vibepress_mysql
-    restart: unless-stopped
+    container_name: wp-db
+    restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-vibepress_root}
-      MYSQL_DATABASE: ${MYSQL_DB:-vibepress}
-      MYSQL_USER: ${MYSQL_USER:-vibepress}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-vibepress_pass}
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wpuser
+      MYSQL_PASSWORD: wppassword
+      MYSQL_ROOT_PASSWORD: rootpassword
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-vibepress.sql
     ports:
       - "3307:3306"
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-  app:
-    build:
-      context: ./automation
-      dockerfile: Dockerfile
-    container_name: vibepress_app
-    restart: unless-stopped
-    env_file: ./automation/.env
+  wordpress:
+    image: wordpress:6.6-php8.2-apache
+    container_name: wp-app
+    ports:
+      - "8000:80"
     environment:
-      MYSQL_HOST: mysql
-      MYSQL_PORT: 3306
-      MYSQL_DB: ${MYSQL_DB:-vibepress}
-      MYSQL_USER: ${MYSQL_USER:-vibepress}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-vibepress_pass}
-      MYSQL_ROOT_USER: root
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-vibepress_root}
-      AI_PIPELINE_HOST: ai_pipeline
-    ports:
-      - "5000:5000"
-    depends_on:
-      mysql:
-        condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_USER: wpuser
+      WORDPRESS_DB_PASSWORD: wppassword
+      WORDPRESS_DB_NAME: wordpress
     volumes:
-      - ./automation/uploads:/app/uploads
-      - ./automation/artifacts:/app/artifacts
-      - ./automation/temp_dumps:/app/temp_dumps
-      - ./automation/temp_workspaces:/app/temp_workspaces
-      - ai_generated:/ai-pipeline/temp/generated
-
-  ai_pipeline:
-    build:
-      context: ./ai-pipeline
-      dockerfile: Dockerfile
-    container_name: vibepress_ai_pipeline
-    restart: unless-stopped
-    env_file: ./ai-pipeline/.env
-    ports:
-      - "3001:3001"
-    volumes:
-      - ai_generated:/app/temp/generated
-
-  frontend:
-    build:
-      context: ./xpress-react-spa
-      dockerfile: Dockerfile
-      args:
-        VITE_BACKEND_URL: ""
-        VITE_BACKEND_AI_URL: /ai-api
-        VITE_WP_URL: ""
-    container_name: vibepress_frontend
-    restart: unless-stopped
-    ports:
-      - "80:80"
+      - wp_data:/var/www/html
+      - ./themes:/var/www/html/wp-content/themes
     depends_on:
-      - app
-      - ai_pipeline
+      - db
 
 volumes:
-  mysql_data:
-  ai_generated:
+  db_data:
+  wp_data:

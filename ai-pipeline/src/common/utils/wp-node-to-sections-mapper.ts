@@ -194,7 +194,7 @@ function mapNode(node: WpNode, siblings: WpNode[]): SectionPlan[] {
   }
 
   // Spectra interactive blocks — preserve as-is for specialized React component generation
-  if (isSpectraBlock(block)) {
+  if (isSpectraBlock(node)) {
     return toMappedSections(mapSpectraSection(node), node);
   }
 
