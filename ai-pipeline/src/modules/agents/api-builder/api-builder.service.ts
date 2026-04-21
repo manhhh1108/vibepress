@@ -1,0 +1,225 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { cp, readFile, writeFile } from 'fs/promises';
+import { join, resolve } from 'path';
+import type { DbContentResult } from '../db-content/db-content.service.js';
+import { LlmFactoryService } from '../../../common/llm/llm-factory.service.js';
+import { TokenTracker } from '../../../common/utils/token-tracker.js';
+import { buildCptRoutesPrompt } from './prompts/api.prompt.js';
+
+const TEMPLATE_DIR = resolve('templates/express-server');
+const AI_ROUTE_EXCLUDED_CPTS = new Set(['product']);
+
+/** LLMs sometimes emit `app.get(getPrefix() + '...')` — that calls getPrefix at load time without conn and crashes. */
+function assertInjectedRoutesDoNotMisuseGetPrefix(injectedCode: string): void {
+  const routeMisuse = /app\.(?:get|post|put|delete|patch)\(\s*getPrefix\s*\(/;
+  const concatMisuse = /\bgetPrefix\s*\(\s*\)\s*\+/;
+  if (routeMisuse.test(injectedCode) || concatMisuse.test(injectedCode)) {
+    throw new Error(
+      'Generated API routes misuse getPrefix(): use a string literal for the route path ' +
+        '(e.g. app.get("/api/...")) and call `const prefix = await getPrefix(conn)` inside the handler after getConn().',
+    );
+  }
+}
+
+function sanitizeGeneratedRouteHandlers(raw: string): string {
+  const stripped = raw
+    .replace(/^```[\w]*\n?/m, '')
+    .replace(/\n?```$/m, '')
+    .trim();
+
+  if (!stripped) return '';
+
+  const firstHandlerStart = stripped.search(
+    /\bapp\.(?:get|post|put|delete|patch)\s*\(/,
+  );
+  const listenStart = stripped.search(/\bapp\.listen\s*\(/);
+
+  let candidate = stripped;
+  if (firstHandlerStart > 0) {
+    candidate = stripped.slice(firstHandlerStart).trim();
+  }
+  if (listenStart !== -1) {
+    const relativeListenStart = candidate.search(/\bapp\.listen\s*\(/);
+    if (relativeListenStart !== -1) {
+      candidate = candidate.slice(0, relativeListenStart).trim();
+    }
+  }
+
+  return candidate.trim();
+}
+
+export interface ApiBuilderResult {
+  outDir: string;
+  files: { name: string; filePath: string; code: string }[];
+}
+
+function shouldSkipCustomPostTypeRoute(
+  cpt: DbContentResult['customPostTypes'][number],
+) {
+  return (
+    AI_ROUTE_EXCLUDED_CPTS.has(cpt.postType) ||
+    cpt.taxonomies.some((taxonomy) =>
+      ['product_cat', 'product_tag', 'product_type'].includes(taxonomy),
+    )
+  );
+}
+
+@Injectable()
+export class ApiBuilderService {
+  private readonly logger = new Logger(ApiBuilderService.name);
+  private readonly tokenTracker = new TokenTracker();
+
+  constructor(private readonly llm: LlmFactoryService) {}
+
+  async build(input: {
+    jobId?: string;
+    dbName: string;
+    logPath?: string;
+    content: Pick<DbContentResult, 'customPostTypes'>;
+  }): Promise<ApiBuilderResult> {
+    const { jobId = 'unknown', content, logPath } = input;
+    const outDir = join('./temp/generated', jobId, 'server');
+    const customPostTypesNeedingRoutes = content.customPostTypes.filter(
+      (cpt) => !shouldSkipCustomPostTypeRoute(cpt),
+    );
+
+    this.logger.log(`Copying Express server template for job: ${jobId}`);
+    await cp(TEMPLATE_DIR, outDir, { recursive: true });
+
+    const templateFile = join(outDir, 'index.ts');
+
+    // No custom post types needing dedicated routes → template is sufficient
+    if (customPostTypesNeedingRoutes.length === 0) {
+      this.logger.log(
+        `No custom post types needing dedicated routes — using template as-is`,
+      );
+      const code = await readFile(templateFile, 'utf-8');
+      return {
+        outDir,
+        files: [{ name: 'index.ts', filePath: templateFile, code }],
+      };
+    }
+
+    if (content.customPostTypes.length > 0) {
+      const skipped = content.customPostTypes.filter(
+        shouldSkipCustomPostTypeRoute,
+      );
+      if (skipped.length > 0) {
+        this.logger.log(
+          `Skipping AI routes for template-covered/excluded CPT(s): ${skipped
+            .map((c) => `${c.postType}(${c.count})`)
+            .join(', ')}`,
+        );
+      }
+    }
+    if (customPostTypesNeedingRoutes.length > 0) {
+      this.logger.log(
+        `Detected ${customPostTypesNeedingRoutes.length} custom post type(s) needing AI routes: ` +
+          customPostTypesNeedingRoutes
+            .map((c) => `${c.postType}(${c.count})`)
+            .join(', '),
+      );
+    }
+    const generationContent = {
+      customPostTypes: customPostTypesNeedingRoutes,
+    };
+
+    // Ask LLM to generate ONLY the extra routes for custom post types
+    const prompt = buildCptRoutesPrompt(generationContent);
+    const { text, inputTokens, outputTokens } = await this.llm.chat({
+      model: this.llm.getModel(),
+      systemPrompt:
+        'You are an Express + TypeScript backend engineer. Return ONLY raw Express route handler code. No prose, no markdown fences, no comments outside the handlers.',
+      userPrompt: prompt,
+      maxTokens: 4096,
+      temperature: 0,
+    });
+    const tokenLogPath = TokenTracker.getTokenLogPath(logPath);
+    if (tokenLogPath) {
+      await this.tokenTracker.init(tokenLogPath);
+      await this.tokenTracker.track(
+        this.llm.getModel(),
+        inputTokens,
+        outputTokens,
+        'backend-gen:routes',
+      );
+    }
+
+    const extraRoutes = sanitizeGeneratedRouteHandlers(text);
+    if (!extraRoutes) {
+      throw new Error(
+        'Generated API routes were empty or did not contain any Express route handlers.',
+      );
+    }
+
+    // Inject the generated routes into the template just before app.listen(...)
+    const templateCode = await readFile(templateFile, 'utf-8');
+    const injected = templateCode.replace(
+      /^(app\.listen\()/m,
+      `${extraRoutes}\n\n$1`,
+    );
+
+    assertInjectedRoutesDoNotMisuseGetPrefix(injected);
+
+    await writeFile(templateFile, injected, 'utf-8');
+    const injectSummary = [
+      customPostTypesNeedingRoutes.length > 0
+        ? `${customPostTypesNeedingRoutes.length} CPT(s)`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+    this.logger.log(`Injected [${injectSummary}] into ${templateFile}`);
+
+    return {
+      outDir,
+      files: [{ name: 'index.ts', filePath: templateFile, code: injected }],
+    };
+  }
+
+  async fixApi(input: {
+    result: ApiBuilderResult;
+    feedback: string;
+    modelName?: string;
+    logPath?: string;
+  }): Promise<ApiBuilderResult> {
+    const { result, feedback, modelName } = input;
+    const resolvedModel = modelName ?? this.llm.getModel();
+    const tokenLogPath = TokenTracker.getTokenLogPath(input.logPath);
+
+    this.logger.log(`[api-fixer] Auto-fixing backend based on review feedback`);
+
+    // For now, we only have one backend file: index.ts
+    const indexFile = result.files.find((f) => f.name === 'index.ts');
+    if (!indexFile) return result;
+
+    const { text, inputTokens, outputTokens } = await this.llm.chat({
+      model: resolvedModel,
+      systemPrompt:
+        'You are an Express/TypeScript expert. Fix the reported issue in the server code. Return ONLY the complete corrected code, no explanation.',
+      userPrompt: `The following Express server code has a review failure: ${feedback}\n\nFix it and return the complete corrected code:\n\`\`\`ts\n${indexFile.code}\n\`\`\``,
+      maxTokens: 4096,
+    });
+    if (tokenLogPath) {
+      await this.tokenTracker.init(tokenLogPath);
+      await this.tokenTracker.track(
+        resolvedModel,
+        inputTokens,
+        outputTokens,
+        'backend-fix:1',
+      );
+    }
+
+    const fixedCode = text
+      .replace(/^```[\w]*\n?/m, '')
+      .replace(/\n?```$/m, '')
+      .trim();
+
+    assertInjectedRoutesDoNotMisuseGetPrefix(fixedCode);
+
+    await writeFile(indexFile.filePath, fixedCode, 'utf-8');
+    indexFile.code = fixedCode;
+
+    return result;
+  }
+}

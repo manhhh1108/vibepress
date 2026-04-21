@@ -1,0 +1,1106 @@
+/**
+ * Deterministic mapper: WpNode[] → SectionPlan[]
+ *
+ * Reads the ordered WpNode tree (already parsed from WordPress block markup)
+ * and produces a draft SectionPlan[] that preserves the exact section order
+ * from the original WordPress template.
+ *
+ * The draft is injected into the AI visual-plan prompt as a hard-ordered
+ * skeleton.  AI is only allowed to fill in content fields (headings, image
+ * src, menu slugs, etc.) — it must NOT reorder, merge, or drop sections
+ * unless the underlying source structure explicitly contradicts the draft.
+ */
+
+import type { WpNode } from './wp-block-to-json.js';
+import { isSpectraBlock } from './spectra-block-mapper.js';
+import type {
+  SectionPlan,
+  TypographyStyle,
+  NavbarSection,
+  HeroSection,
+  CoverSection,
+  PostListSection,
+  CardGridSection,
+  MediaTextSection,
+  FooterSection,
+  PostContentSection,
+  PageContentSection,
+  SearchSection,
+  BreadcrumbSection,
+  SidebarSection,
+  TestimonialSection,
+} from '../../modules/agents/react-generator/visual-plan.schema.js';
+
+// ── Public entry point ──────────────────────────────────────────────────────
+
+/**
+ * Map an ordered WpNode[] into a draft SectionPlan[].
+ * Returns an empty array when nothing can be recognised (caller falls back to
+ * AI-only planning).
+ */
+export function mapWpNodesToDraftSections(nodes: WpNode[]): SectionPlan[] {
+  return mapNodes(nodes, nodes);
+}
+
+// ── Per-node dispatch ───────────────────────────────────────────────────────
+
+function mapNodes(nodes: WpNode[], siblings: WpNode[]): SectionPlan[] {
+  const sections: SectionPlan[] = [];
+  let pendingSpacer: string | undefined;
+  for (const node of nodes) {
+    if (isSpacerBlock(node.block)) {
+      pendingSpacer = resolveSpacerHeight(node) ?? pendingSpacer;
+      continue;
+    }
+
+    const mapped = mapNode(node, siblings);
+    if (mapped.length === 0) continue;
+
+    if (pendingSpacer) {
+      mapped[0] = applyLeadingSpacer(mapped[0], pendingSpacer);
+      pendingSpacer = undefined;
+    }
+
+    for (const section of mapped) {
+      const last = sections[sections.length - 1];
+      const mergedSection =
+        last && section.type === 'card-grid' && last.type === 'card-grid'
+          ? mergeAdjacentCardGridRows(last, section)
+          : null;
+      if (mergedSection) {
+        sections[sections.length - 1] = mergedSection;
+        continue;
+      }
+      sections.push(section);
+    }
+  }
+
+  if (pendingSpacer && sections.length > 0) {
+    sections[sections.length - 1] = applyTrailingSpacer(
+      sections[sections.length - 1],
+      pendingSpacer,
+    );
+  }
+  return sections;
+}
+
+function mergeAdjacentCardGridRows(
+  previous: CardGridSection,
+  current: CardGridSection,
+): CardGridSection | null {
+  // WordPress often stores a single logical card grid as multiple adjacent
+  // `wp:columns` rows separated only by spacers. Merge all consecutive card-grid
+  // sections that share the same column count, regardless of columnWidths or
+  // row count. This ensures multi-row card grids export correctly.
+  if (previous.columns !== current.columns) {
+    return null;
+  }
+
+  return {
+    ...previous,
+    columns: previous.columns,
+    // Keep previous columnWidths (if any). If previous has none, fall back to current.
+    columnWidths: previous.columnWidths ?? current.columnWidths,
+    cards: [...previous.cards, ...current.cards],
+  };
+}
+
+function mapNode(node: WpNode, siblings: WpNode[]): SectionPlan[] {
+  const block = node.block;
+
+  // template-part blocks: delegate by slug
+  if (block === 'core/template-part' || block === 'template-part') {
+    return toMappedSections(mapTemplatePart(node), node);
+  }
+
+  // Navigation / site header chrome
+  if (block === 'core/navigation' || block === 'navigation') {
+    return toMappedSections(mapNavigation(node), node);
+  }
+
+  // Group acting as a page-level wrapper — recurse into children
+  if ((block === 'core/group' || block === 'group') && node.children?.length) {
+    return mapGroup(node, siblings);
+  }
+
+  // Cover block (hero with background image)
+  if (block === 'core/cover' || block === 'cover') {
+    return toMappedSections(mapCover(node), node);
+  }
+
+  // Standalone image block: preserve it as an explicit visual section instead
+  // of expecting the LLM to remember an image-only region from raw HTML.
+  if (block === 'core/image' || block === 'image') {
+    return toMappedSections(mapImage(node), node);
+  }
+
+  if (node.src) {
+    return toMappedSections(mapImage(node), node);
+  }
+
+  // Query / post loop
+  if (block === 'core/query' || block === 'query') {
+    return toMappedSections(mapQuery(node), node);
+  }
+
+  // Columns: media-text or card-grid depending on content
+  if (block === 'core/columns' || block === 'columns') {
+    return toMappedSections(mapColumns(node), node);
+  }
+
+  // Post / page content placeholder blocks
+  if (block === 'core/post-content' || block === 'post-content') {
+    return toMappedSections(mapPostContent(node), node);
+  }
+  if (
+    block === 'core/page-list' ||
+    block === 'core/pages' ||
+    block === 'page-list'
+  ) {
+    // Treat as page-content placeholder
+    const s: PageContentSection = { type: 'page-content', showTitle: true };
+    return toMappedSections(s, node);
+  }
+
+  // Search
+  if (block === 'core/search' || block === 'search') {
+    const s: SearchSection = { type: 'search' };
+    return toMappedSections(s, node);
+  }
+
+  // Separator / spacer — skip, not a section
+  if (block === 'core/separator' || block === 'separator') {
+    return [];
+  }
+
+  if (block === 'core/quote' || block === 'quote') {
+    return toMappedSections(mapQuote(node), node);
+  }
+
+  if (block === 'core/pullquote' || block === 'pullquote') {
+    return toMappedSections(mapQuote(node), node);
+  }
+
+  if (block === 'core/heading' || block === 'heading') {
+    return toMappedSections(mapStandaloneHeading(node), node);
+  }
+
+  // Spectra container/section/columns — treat like core/group
+  if (
+    (block === 'uagb/container' || block === 'uagb/section' || block === 'uagb/columns') &&
+    node.children?.length
+  ) {
+    return mapGroup(node, siblings);
+  }
+
+  // Spectra interactive blocks — preserve as-is for specialized React component generation
+  if (isSpectraBlock(block)) {
+    return toMappedSections(mapSpectraSection(node), node);
+  }
+
+  return [];
+}
+
+// ── Spectra block mapping ────────────────────────────────────────────────────
+
+function mapSpectraSection(node: WpNode): SectionPlan | null {
+  const block = node.block;
+
+  // Spectra tabs → card-grid-like section with tab content
+  if (block === 'uagb/tabs') {
+    const children = node.children ?? [];
+    const cards = children
+      .filter((c) => c.block === 'uagb/tabs-child')
+      .map((tab) => ({
+        heading: tab.params?.tabTitle ?? tab.text ?? '',
+        body: extractNodeText(tab) || '',
+      }))
+      .filter((c) => c.heading || c.body);
+    if (cards.length === 0) return null;
+    return {
+      type: 'card-grid' as const,
+      columns: Math.min(cards.length, 4) as 2 | 3 | 4,
+      cards,
+    };
+  }
+
+  // Spectra accordion → card-grid with Q/A pairs
+  if (block === 'uagb/accordion' || block === 'uagb/faq') {
+    const children = node.children ?? [];
+    const cards = children.map((item) => ({
+      heading: item.params?.question ?? item.text ?? '',
+      body: item.params?.answer ?? (item.children?.map((c) => c.text ?? c.html ?? '').join(' ')) ?? '',
+    })).filter((c) => c.heading || c.body);
+    if (cards.length === 0) return null;
+    return {
+      type: 'card-grid' as const,
+      columns: Math.min(Math.max(cards.length, 2), 4) as 2 | 3 | 4,
+      cards,
+    };
+  }
+
+  // Spectra counter → hero-like section
+  if (block === 'uagb/counter') {
+    const hero: HeroSection = {
+      type: 'hero',
+      layout: 'centered',
+      heading: node.params?.ending?.toString() ?? node.text ?? '',
+      subheading: node.params?.title ?? node.params?.heading ?? '',
+    };
+    return hero;
+  }
+
+  // Spectra call-to-action → hero section
+  if (block === 'uagb/call-to-action') {
+    const flat = flattenChildren(node);
+    const h = flat.find((c) => c.block === 'core/heading' || c.block === 'heading');
+    const p = flat.find((c) => c.block === 'core/paragraph' || c.block === 'paragraph');
+    const btn = flat.find((c) => c.block === 'core/button' || c.block === 'button');
+    const hero: HeroSection = {
+      type: 'hero',
+      layout: 'centered',
+      heading: node.params?.ctaTitle ?? h?.text ?? '',
+      subheading: node.params?.description ?? p?.text ?? '',
+    };
+    if (btn?.text || node.params?.ctaText) {
+      hero.cta = { text: node.params?.ctaText ?? btn?.text ?? '', link: node.params?.ctaLink ?? btn?.href ?? '#' };
+    }
+    return hero;
+  }
+
+  // Spectra testimonials → testimonial section
+  if (block === 'uagb/testimonials' || block === 'uagb/testimonial') {
+    const quote = node.params?.description ?? extractNodeText(node) ?? '';
+    return {
+      type: 'testimonial' as const,
+      quote,
+      authorName: node.params?.authorName ?? node.params?.name ?? '',
+      authorTitle: node.params?.company ?? node.params?.designation ?? undefined,
+    };
+  }
+
+  // Spectra post-grid/post-carousel → post-list
+  if (block === 'uagb/post-grid' || block === 'uagb/post-carousel' || block === 'uagb/post-masonry') {
+    const columns = Number(node.params?.columns ?? 3);
+    const layout: 'list' | 'grid-2' | 'grid-3' = columns >= 3 ? 'grid-3' : columns === 2 ? 'grid-2' : 'list';
+    return {
+      type: 'post-list' as const,
+      layout,
+      showDate: node.params?.displayPostDate !== false,
+      showAuthor: node.params?.displayPostAuthor !== false,
+      showCategory: node.params?.displayPostCategory !== false,
+      showExcerpt: node.params?.displayPostExcerpt !== false,
+      showFeaturedImage: node.params?.displayPostImage !== false,
+    };
+  }
+
+  // Spectra info-box → media-text or hero
+  if (block === 'uagb/info-box') {
+    const imageSrc = node.params?.iconImage?.url ?? node.src ?? '';
+    if (imageSrc) {
+      return {
+        type: 'media-text' as const,
+        imageSrc,
+        imageAlt: node.params?.iconImage?.alt ?? '',
+        imagePosition: 'left' as const,
+        heading: node.params?.infoBoxTitle ?? '',
+        body: node.params?.headingDesc ?? '',
+      };
+    }
+    return {
+      type: 'hero' as const,
+      layout: 'centered' as const,
+      heading: node.params?.infoBoxTitle ?? '',
+      subheading: node.params?.headingDesc ?? '',
+    };
+  }
+
+  // Spectra slider → cover section with first slide image
+  if (block === 'uagb/slider' || block === 'uagb/image-slider') {
+    const firstSlide = node.children?.[0];
+    const src = firstSlide?.src ?? firstSlide?.params?.image?.url ?? '';
+    return {
+      type: 'cover' as const,
+      imageSrc: src || '',
+      dimRatio: 30,
+      minHeight: '400px',
+      contentAlign: 'center' as const,
+    };
+  }
+
+  // Spectra modal → ignore in section plan (interactive overlay)
+  if (block === 'uagb/modal') {
+    return null;
+  }
+
+  // Spectra container/section/columns → recurse into mapGroup-like behavior
+  if (
+    block === 'uagb/container' ||
+    block === 'uagb/section' ||
+    block === 'uagb/columns'
+  ) {
+    // Treat like core/group — will be handled by recursion
+    return null;
+  }
+
+  // Spectra image-gallery → cover
+  if (block === 'uagb/image-gallery') {
+    const firstImg = node.params?.images?.[0];
+    const src = firstImg?.url ?? '';
+    return {
+      type: 'cover' as const,
+      imageSrc: src || '',
+      dimRatio: 0,
+      minHeight: '400px',
+      contentAlign: 'center' as const,
+    };
+  }
+
+  return null;
+}
+
+// ── template-part ───────────────────────────────────────────────────────────
+
+function mapTemplatePart(node: WpNode): SectionPlan | null {
+  const slug: string = (node.params?.slug ??
+    node.params?.theme ??
+    '') as string;
+  const slugL = slug.toLowerCase();
+
+  if (slugL.includes('header') || slugL.includes('nav')) {
+    const s: NavbarSection = {
+      type: 'navbar',
+      sticky: false,
+      menuSlug: 'primary',
+    };
+    return s;
+  }
+  if (slugL.includes('footer')) {
+    const s: FooterSection = {
+      type: 'footer',
+      menuColumns: [],
+    };
+    return s;
+  }
+  if (slugL.includes('sidebar')) {
+    const s: SidebarSection = {
+      type: 'sidebar',
+      showSiteInfo: false,
+      showPages: true,
+      showPosts: true,
+    };
+    return s;
+  }
+  if (slugL.includes('breadcrumb')) {
+    const s: BreadcrumbSection = { type: 'breadcrumb' };
+    return s;
+  }
+  return null;
+}
+
+// ── navigation ──────────────────────────────────────────────────────────────
+
+function mapNavigation(node: WpNode): NavbarSection {
+  // Try to infer menuSlug from navigation-link children labels
+  const menuSlug = inferMenuSlugFromNavChildren(node.children ?? []);
+  return {
+    type: 'navbar',
+    sticky: false,
+    menuSlug: menuSlug ?? 'primary',
+  };
+}
+
+function inferMenuSlugFromNavChildren(children: WpNode[]): string | undefined {
+  // If the WP navigation block has a `ref` (menu ID), we can't resolve it here.
+  // Return undefined so AI will fill in the correct menuSlug from live menus.
+  return undefined;
+}
+
+// ── cover block ─────────────────────────────────────────────────────────────
+
+function mapCover(node: WpNode): CoverSection | HeroSection {
+  // If it has a background image and dimRatio it's a cover/hero
+  const src = node.src ?? '';
+  const dimRatio = (node.params?.dimRatio as number | undefined) ?? 50;
+  const minHeight = normalizeCssLength(node.minHeight) ?? '400px';
+  const contentAlign = (
+    node.params?.contentPosition as string | undefined
+  )?.includes('left')
+    ? 'left'
+    : (node.params?.contentPosition as string | undefined)?.includes('right')
+      ? 'right'
+      : 'center';
+
+  if (src) {
+    const s: CoverSection = {
+      type: 'cover',
+      imageSrc: src,
+      dimRatio,
+      minHeight,
+      contentAlign,
+    };
+    // Lift heading/subheading from children
+    const headingNode = findFirstByBlock(node.children ?? [], [
+      'core/heading',
+      'heading',
+    ]);
+    if (headingNode?.text) s.heading = headingNode.text;
+    if (headingNode?.typography || headingNode?.fontFamily) {
+      s.headingStyle = toTypographyStyle(headingNode);
+    }
+    const paraNode = findFirstByBlock(node.children ?? [], [
+      'core/paragraph',
+      'paragraph',
+    ]);
+    if (paraNode?.text) s.subheading = paraNode.text;
+    if (paraNode?.typography || paraNode?.fontFamily) {
+      s.subheadingStyle = toTypographyStyle(paraNode);
+    }
+    const btnNode = findFirstByBlock(node.children ?? [], [
+      'core/button',
+      'button',
+      'core/buttons',
+      'buttons',
+    ]);
+    if (btnNode?.text)
+      s.cta = { text: btnNode.text, link: btnNode.href ?? '#' };
+    return s;
+  }
+
+  // No image — treat as a text-only hero section
+  const s: HeroSection = {
+    type: 'hero',
+    layout: contentAlign === 'center' ? 'centered' : 'left',
+    heading: '',
+  };
+  const h = findFirstByBlock(node.children ?? [], ['core/heading', 'heading']);
+  if (h?.text) s.heading = h.text;
+  if (h?.typography || h?.fontFamily) s.headingStyle = toTypographyStyle(h);
+  const p = findFirstByBlock(node.children ?? [], [
+    'core/paragraph',
+    'paragraph',
+  ]);
+  if (p?.text) s.subheading = p.text;
+  if (p?.typography || p?.fontFamily) s.subheadingStyle = toTypographyStyle(p);
+  return s;
+}
+
+function mapImage(node: WpNode): CoverSection | null {
+  if (!node.src) return null;
+
+  return {
+    type: 'cover',
+    imageSrc: node.src,
+    dimRatio: 0,
+    minHeight: normalizeCssLength(node.minHeight) ?? '420px',
+    contentAlign: 'center',
+  };
+}
+
+// ── group block ─────────────────────────────────────────────────────────────
+
+function mapGroup(node: WpNode, _siblings: WpNode[]): SectionPlan[] {
+  const children = node.children ?? [];
+  if (children.length === 0) return [];
+
+  const groupedCardGrid = buildGroupedCardGrid(children);
+  if (groupedCardGrid) {
+    return toMappedSections(groupedCardGrid, node);
+  }
+
+  // Group acting as a hero: has heading + paragraph (+ optional button)
+  if (isHeroGroup(children)) {
+    return toMappedSections(buildHeroFromChildren(node, children), node);
+  }
+
+  // Group acting as a 2-column media-text layout
+  if (isMediaTextGroup(children)) {
+    return toMappedSections(buildMediaTextFromColumns(children), node);
+  }
+
+  // Group with a query inside → defer to query mapper
+  const queryChild = children.find(
+    (c) => c.block === 'core/query' || c.block === 'query',
+  );
+  if (queryChild) return toMappedSections(mapQuery(queryChild), node);
+
+  // Group with a search block
+  const searchChild = children.find(
+    (c) => c.block === 'core/search' || c.block === 'search',
+  );
+  if (searchChild) {
+    const s: SearchSection = { type: 'search' };
+    const headingChild = findFirstByBlock(children, [
+      'core/heading',
+      'heading',
+    ]);
+    if (headingChild?.text) s.title = headingChild.text;
+    return toMappedSections(s, node);
+  }
+
+  // Nested group that contains further sub-sections — recurse and keep them all.
+  const nestedSections = mapNodes(children, children);
+  if (nestedSections.length === 1) {
+    return [applyNodePresentation(nestedSections[0], node)];
+  }
+  return nestedSections;
+}
+
+// ── query block (post list) ─────────────────────────────────────────────────
+
+function mapQuery(node: WpNode): PostListSection {
+  const postTemplate = findFirstByBlock(node.children ?? [], [
+    'core/post-template',
+    'post-template',
+  ]);
+  const templateNodes = postTemplate ? flattenChildren(postTemplate) : [];
+  const displayColumns = Number(
+    node.params?.displayLayout?.columns ??
+      postTemplate?.params?.layout?.columnCount ??
+      postTemplate?.params?.layout?.columns ??
+      0,
+  );
+  const columnsInTemplate =
+    postTemplate?.children?.some(
+      (c) => c.block === 'core/columns' || c.block === 'columns',
+    ) ?? false;
+  const layout: PostListSection['layout'] =
+    Number.isFinite(displayColumns) && displayColumns >= 3
+      ? 'grid-3'
+      : displayColumns === 2
+        ? 'grid-2'
+        : columnsInTemplate
+          ? 'grid-3'
+          : 'list';
+
+  const hasAuthorBlock = templateNodes.some((child) =>
+    ['core/post-author', 'post-author'].includes(child.block),
+  );
+  const hasDateBlock = templateNodes.some((child) =>
+    ['core/post-date', 'post-date'].includes(child.block),
+  );
+  const hasTermsBlock = templateNodes.some((child) =>
+    ['core/post-terms', 'post-terms'].includes(child.block),
+  );
+  const hasExcerptBlock = templateNodes.some((child) =>
+    ['core/post-excerpt', 'post-excerpt'].includes(child.block),
+  );
+  const hasFeaturedImageBlock = templateNodes.some((child) =>
+    ['core/post-featured-image', 'post-featured-image'].includes(child.block),
+  );
+
+  return {
+    type: 'post-list',
+    layout,
+    showDate: booleanAttr(node.params?.displayPostDate, hasDateBlock || true),
+    showAuthor: booleanAttr(node.params?.displayAuthor, hasAuthorBlock),
+    showCategory: booleanAttr(
+      node.params?.displayPostTerms ?? node.params?.displayCategories,
+      hasTermsBlock,
+    ),
+    showExcerpt: booleanAttr(
+      node.params?.displayPostExcerpt,
+      hasExcerptBlock || true,
+    ),
+    showFeaturedImage: booleanAttr(
+      node.params?.displayFeaturedImage,
+      hasFeaturedImageBlock || true,
+    ),
+  };
+}
+
+// ── columns block ───────────────────────────────────────────────────────────
+
+function mapColumns(node: WpNode): CardGridSection | MediaTextSection | null {
+  const cols =
+    node.children?.filter(
+      (c) => c.block === 'core/column' || c.block === 'column',
+    ) ?? [];
+
+  if (cols.length === 0) return null;
+
+  // 2-col: check if one side is image and other is text → media-text
+  if (cols.length === 2) {
+    const hasImage = cols.some(
+      (c) =>
+        findFirstByBlock(flattenChildren(c), ['core/image', 'image']) !== null,
+    );
+    if (hasImage) {
+      return buildMediaTextFromColumns(cols);
+    }
+  }
+
+  // Otherwise: card-grid
+  const cards = cols
+    .map((col) => {
+      const h = findFirstByBlock(flattenChildren(col), [
+        'core/heading',
+        'heading',
+      ]);
+      const p = findFirstByBlock(flattenChildren(col), [
+        'core/paragraph',
+        'paragraph',
+      ]);
+      return {
+        heading: h?.text ?? '',
+        body: p?.text ?? '',
+      };
+    })
+    .filter((c) => c.heading || c.body);
+
+  if (cards.length === 0) return null;
+
+  const colCount = Math.min(Math.max(cols.length, 2), 4) as 2 | 3 | 4;
+  const s: CardGridSection = {
+    type: 'card-grid',
+    columns: colCount,
+    cards,
+  };
+  const columnWidths = cols
+    .map((col) => normalizeCssLength(col.columnWidth))
+    .filter((value): value is string => !!value);
+  if (columnWidths.length === cols.length) s.columnWidths = columnWidths;
+  return s;
+}
+
+// ── post-content ────────────────────────────────────────────────────────────
+
+function mapPostContent(node: WpNode): PostContentSection | PageContentSection {
+  // If it's inside a post/single template context it's a post-content; the
+  // caller decides dataNeeds. We default to post-content and let AI/reviewer
+  // correct it when the component contract says pageDetail instead.
+  const s: PostContentSection = {
+    type: 'post-content',
+    showTitle: true,
+    showAuthor: true,
+    showDate: true,
+    showCategories: true,
+  };
+  return s;
+}
+
+// ── standalone heading / quote ──────────────────────────────────────────────
+
+function mapStandaloneHeading(node: WpNode): HeroSection | null {
+  if (!node.text?.trim()) return null;
+  const hero: HeroSection = {
+    type: 'hero',
+    layout: node.textAlign === 'center' ? 'centered' : 'left',
+    heading: node.text ?? '',
+  };
+  if (node.typography || node.fontFamily) {
+    hero.headingStyle = toTypographyStyle(node);
+  }
+  return hero;
+}
+
+function mapQuote(node: WpNode): TestimonialSection | null {
+  const quote = extractNodeText(node);
+  if (!quote) return null;
+
+  const authorMatch = node.html?.match(/<cite[^>]*>([\s\S]*?)<\/cite>/i);
+  const authorName = authorMatch ? stripInlineHtml(authorMatch[1]) : '';
+
+  return {
+    type: 'testimonial',
+    quote,
+    authorName,
+  };
+}
+
+function toMappedSections(
+  section: SectionPlan | null,
+  node: WpNode,
+): SectionPlan[] {
+  if (!section) return [];
+  return [applyNodePresentation(section, node)];
+}
+
+function applyNodePresentation<T extends SectionPlan>(
+  section: T,
+  node: WpNode,
+): T {
+  const next: T = { ...section };
+  if (node.sourceRef && !next.sourceRef) next.sourceRef = node.sourceRef;
+  if (!next.sectionKey) {
+    next.sectionKey = buildSectionKey(next.type, node.sourceRef?.topLevelIndex);
+  }
+  if (node.bgColor && !next.background) next.background = node.bgColor;
+  if (node.textColor && !next.textColor) next.textColor = node.textColor;
+  if (node.padding && !next.paddingStyle) {
+    next.paddingStyle = boxSpacingToCss(node.padding);
+  }
+  if (node.margin && !next.marginStyle) {
+    next.marginStyle = boxSpacingToCss(node.margin);
+  }
+  if (node.gap && !next.gapStyle) {
+    next.gapStyle = node.gap;
+  }
+  const customClassNames = uniqueClassNames([
+    ...(next.customClassNames ?? []),
+    ...(node.customClassNames ?? []),
+  ]);
+  if (customClassNames.length > 0) {
+    next.customClassNames = customClassNames;
+  }
+  return next;
+}
+
+function buildSectionKey(
+  type: SectionPlan['type'],
+  topLevelIndex?: number,
+): string {
+  if (typeof topLevelIndex !== 'number' || topLevelIndex <= 0) {
+    return type;
+  }
+  return `${type}-${topLevelIndex}`;
+}
+
+// ── helpers: recognise group intent ────────────────────────────────────────
+
+function isHeroGroup(children: WpNode[]): boolean {
+  const flat = flattenChildren({ children } as WpNode);
+  const hasH1OrH2 = flat.some(
+    (c) =>
+      (c.block === 'core/heading' || c.block === 'heading') &&
+      (c.level === 1 || c.level === 2),
+  );
+  const hasPara = flat.some(
+    (c) => c.block === 'core/paragraph' || c.block === 'paragraph',
+  );
+  return hasH1OrH2 && hasPara;
+}
+
+function buildGroupedCardGrid(children: WpNode[]): CardGridSection | null {
+  let title: string | undefined;
+  let subtitle: string | undefined;
+  let columnCount: 2 | 3 | 4 = 3;
+  const cards: { heading: string; body: string }[] = [];
+  let foundCardGrid = false;
+
+  for (const child of children) {
+    const block = child.block;
+
+    if (
+      !foundCardGrid &&
+      (block === 'core/heading' || block === 'heading') &&
+      child.text
+    ) {
+      title ??= child.text;
+      continue;
+    }
+
+    if (
+      !foundCardGrid &&
+      (block === 'core/paragraph' || block === 'paragraph') &&
+      child.text
+    ) {
+      subtitle ??= child.text;
+      continue;
+    }
+
+    if (block === 'core/spacer' || block === 'spacer') {
+      continue;
+    }
+
+    const cardGridRows = collectCardGridRows(child);
+    if (cardGridRows) {
+      foundCardGrid = true;
+      for (const row of cardGridRows) {
+        columnCount = row.columns;
+        cards.push(...row.cards);
+      }
+      continue;
+    }
+
+    return null;
+  }
+
+  if (!foundCardGrid || cards.length === 0) return null;
+
+  const section: CardGridSection = {
+    type: 'card-grid',
+    columns: columnCount,
+    cards,
+  };
+  if (title) section.title = title;
+  if (subtitle) section.subtitle = subtitle;
+  return section;
+}
+
+function collectCardGridRows(node: WpNode): CardGridSection[] | null {
+  const block = node.block;
+
+  if (block === 'core/spacer' || block === 'spacer') {
+    return [];
+  }
+
+  if (block === 'core/columns' || block === 'columns') {
+    const mapped = mapColumns(node);
+    return mapped?.type === 'card-grid' ? [mapped] : null;
+  }
+
+  if ((block === 'core/group' || block === 'group') && node.children?.length) {
+    const rows: CardGridSection[] = [];
+    for (const child of node.children) {
+      const nestedRows = collectCardGridRows(child);
+      if (nestedRows === null) return null;
+      rows.push(...nestedRows);
+    }
+    return rows.length > 0 ? rows : null;
+  }
+
+  return null;
+}
+
+function buildHeroFromChildren(
+  groupNode: WpNode,
+  children: WpNode[],
+): HeroSection {
+  const flat = flattenChildren({ children } as WpNode);
+  const h = flat.find(
+    (c) =>
+      (c.block === 'core/heading' || c.block === 'heading') &&
+      (c.level === 1 || c.level === 2),
+  );
+  const p = flat.find(
+    (c) => c.block === 'core/paragraph' || c.block === 'paragraph',
+  );
+  const btn = flat.find(
+    (c) =>
+      c.block === 'core/button' ||
+      c.block === 'button' ||
+      c.block === 'core/buttons' ||
+      c.block === 'buttons',
+  );
+  const img = flat.find((c) => c.block === 'core/image' || c.block === 'image');
+
+  const align = groupNode.textAlign ?? groupNode.params?.textAlign ?? 'left';
+  const layout: HeroSection['layout'] =
+    align === 'center' ? 'centered' : img ? 'split' : 'left';
+
+  const s: HeroSection = {
+    type: 'hero',
+    layout,
+    heading: h?.text ?? '',
+  };
+  if (h?.typography || h?.fontFamily) s.headingStyle = toTypographyStyle(h);
+  if (p?.text) s.subheading = p.text;
+  if (p?.typography || p?.fontFamily) s.subheadingStyle = toTypographyStyle(p);
+  if (btn?.text) s.cta = { text: btn.text, link: btn.href ?? '#' };
+  if (img?.src)
+    s.image = { src: img.src, alt: img.alt ?? '', position: 'right' };
+  if (groupNode.padding) {
+    s.paddingStyle = boxSpacingToCss(groupNode.padding);
+  }
+  return s;
+}
+
+function isMediaTextGroup(children: WpNode[]): boolean {
+  const cols = children.filter(
+    (c) => c.block === 'core/column' || c.block === 'column',
+  );
+  if (cols.length !== 2) return false;
+  const flat0 = flattenChildren(cols[0]);
+  const flat1 = flattenChildren(cols[1]);
+  const hasImg =
+    flat0.some((c) => c.block === 'core/image' || c.block === 'image') ||
+    flat1.some((c) => c.block === 'core/image' || c.block === 'image');
+  return hasImg;
+}
+
+function buildMediaTextFromColumns(
+  cols: WpNode[],
+): MediaTextSection | CardGridSection {
+  const flat0 = flattenChildren(cols[0]);
+  const flat1 = cols[1] ? flattenChildren(cols[1]) : [];
+
+  const imgInFirst = flat0.find(
+    (c) => c.block === 'core/image' || c.block === 'image',
+  );
+  const imgInSecond = flat1.find(
+    (c) => c.block === 'core/image' || c.block === 'image',
+  );
+
+  const imgNode = imgInFirst ?? imgInSecond;
+  if (!imgNode?.src) {
+    // Fallback to card-grid
+    const cards = cols.map((col) => {
+      const flat = flattenChildren(col);
+      const h = flat.find(
+        (c) => c.block === 'core/heading' || c.block === 'heading',
+      );
+      const p = flat.find(
+        (c) => c.block === 'core/paragraph' || c.block === 'paragraph',
+      );
+      return { heading: h?.text ?? '', body: p?.text ?? '' };
+    });
+    return { type: 'card-grid', columns: 2, cards };
+  }
+
+  const textFlat = imgInFirst ? flat1 : flat0;
+  const h = textFlat.find(
+    (c) => c.block === 'core/heading' || c.block === 'heading',
+  );
+  const p = textFlat.find(
+    (c) => c.block === 'core/paragraph' || c.block === 'paragraph',
+  );
+  const btn = textFlat.find(
+    (c) => c.block === 'core/button' || c.block === 'button',
+  );
+  const listItems = textFlat
+    .filter((c) => c.block === 'core/list-item' || c.block === 'list-item')
+    .map((c) => c.html ?? c.text ?? '')
+    .filter(Boolean);
+
+  const s: MediaTextSection = {
+    type: 'media-text',
+    imageSrc: imgNode.src,
+    imageAlt: imgNode.alt ?? '',
+    imagePosition: imgInFirst ? 'left' : 'right',
+  };
+  const columnWidths = cols
+    .map((col) => normalizeCssLength(col.columnWidth))
+    .filter((value): value is string => !!value);
+  if (columnWidths.length === cols.length) s.columnWidths = columnWidths;
+  if (h?.text) s.heading = h.text;
+  if (h?.typography || h?.fontFamily) s.headingStyle = toTypographyStyle(h);
+  if (p?.text) s.body = p.text;
+  if (p?.typography || p?.fontFamily) s.bodyStyle = toTypographyStyle(p);
+  if (listItems.length > 0) s.listItems = listItems;
+  if (btn?.text) s.cta = { text: btn.text, link: btn.href ?? '#' };
+  return s;
+}
+
+// ── low-level helpers ───────────────────────────────────────────────────────
+
+function findFirstByBlock(nodes: WpNode[], blocks: string[]): WpNode | null {
+  for (const node of nodes) {
+    if (blocks.includes(node.block)) return node;
+    if (node.children?.length) {
+      const found = findFirstByBlock(node.children, blocks);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function isSpacerBlock(block: string): boolean {
+  return block === 'core/spacer' || block === 'spacer';
+}
+
+function resolveSpacerHeight(node: WpNode): string | undefined {
+  const raw =
+    node.params?.height ??
+    node.params?.style?.spacing?.height ??
+    node.minHeight;
+  if (raw == null) return undefined;
+  return normalizeCssLength(String(raw));
+}
+
+function applyLeadingSpacer<T extends SectionPlan>(
+  section: T,
+  spacerHeight: string,
+): T {
+  if (section.marginStyle) return section;
+  return {
+    ...section,
+    marginStyle: `${spacerHeight} 0 0`,
+  };
+}
+
+function applyTrailingSpacer<T extends SectionPlan>(
+  section: T,
+  spacerHeight: string,
+): T {
+  if (section.marginStyle) return section;
+  return {
+    ...section,
+    marginStyle: `0 0 ${spacerHeight}`,
+  };
+}
+
+/** Flatten all descendant WpNodes into a single array (depth-first). */
+function flattenChildren(node: WpNode): WpNode[] {
+  const result: WpNode[] = [];
+  const visit = (n: WpNode) => {
+    result.push(n);
+    for (const child of n.children ?? []) visit(child);
+  };
+  for (const child of node.children ?? []) visit(child);
+  return result;
+}
+
+function boxSpacingToCss(box: NonNullable<WpNode['padding']>): string {
+  const { top = '0', right = top, bottom = top, left = right } = box;
+  if (top === right && top === bottom && top === left) return top;
+  if (top === bottom && right === left) return `${top} ${right}`;
+  return `${top} ${right} ${bottom} ${left}`;
+}
+
+function normalizeCssLength(value?: string): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  return /^\d+(\.\d+)?$/.test(normalized) ? `${normalized}px` : normalized;
+}
+
+function booleanAttr(value: unknown, fallback: boolean): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1') return true;
+    if (normalized === 'false' || normalized === '0') return false;
+  }
+  return fallback;
+}
+
+function extractNodeText(node: WpNode): string {
+  if (node.text?.trim()) return node.text.trim();
+  if (node.html?.trim()) return stripInlineHtml(node.html);
+  return '';
+}
+
+function stripInlineHtml(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function toTypographyStyle(node?: WpNode): TypographyStyle | undefined {
+  if (!node) return undefined;
+  const typography: TypographyStyle = {
+    ...(node.typography?.fontSize && { fontSize: node.typography.fontSize }),
+    ...(node.typography?.fontFamily && {
+      fontFamily: node.typography.fontFamily,
+    }),
+    ...(node.fontFamily &&
+      !node.typography?.fontFamily && { fontFamily: node.fontFamily }),
+    ...(node.typography?.fontWeight && {
+      fontWeight: node.typography.fontWeight,
+    }),
+    ...(node.typography?.letterSpacing && {
+      letterSpacing: node.typography.letterSpacing,
+    }),
+    ...(node.typography?.lineHeight && {
+      lineHeight: node.typography.lineHeight,
+    }),
+    ...(node.typography?.textTransform && {
+      textTransform: node.typography.textTransform,
+    }),
+  };
+  return Object.keys(typography).length > 0 ? typography : undefined;
+}
+
+function uniqueClassNames(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}

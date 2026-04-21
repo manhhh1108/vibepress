@@ -1,0 +1,19 @@
+export interface LlmChatParams {
+  model: string;
+  systemPrompt?: string;
+  userPrompt: string;
+  maxTokens?: number;
+  temperature?: number;
+}
+
+export interface LlmChatResult {
+  text: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens?: number;
+  truncated?: boolean;
+}
+
+export type LlmProvider =
+  | 'openai'
+  | 'custom';
